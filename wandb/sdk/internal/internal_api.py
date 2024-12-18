@@ -47,6 +47,7 @@ from wandb.sdk.artifacts._validators import is_artifact_registry_project
 from wandb.sdk.internal.thread_local_settings import _thread_local_api_settings
 from wandb.sdk.lib.gql_request import GraphQLSession
 from wandb.sdk.lib.hashutil import B64MD5, md5_file_b64
+from concurrent.futures import ThreadPoolExecutor
 
 from ..lib import credentials, retry
 from ..lib.filenames import DIFF_FNAME, METADATA_FNAME
@@ -1070,7 +1071,7 @@ class Api:
         """
         query = gql(
             """
-        query SweepWithRuns($entity: String, $project: String, $sweep: String!, $specs: [JSONString!]!) {
+            query SweepWithRuns($entity: String, $project: String, $sweep: String!, $specs: [JSONString!]!, $cursorValue: String) {
             project(name: $project, entityName: $entity) {
                 sweep(sweepName: $sweep) {
                     id
@@ -1086,9 +1087,15 @@ class Api:
                     bestLoss
                     controller
                     scheduler
-                    runs {
-                        edges {
-                            node {
+                    runs (after: $cursorValue) {
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                        edges  {
+                            node  {
                                 name
                                 state
                                 config
@@ -1099,6 +1106,7 @@ class Api:
                                 stopped
                                 running
                                 summaryMetrics
+                                history
                                 sampledHistory(specs: $specs)
                             }
                         }
@@ -1108,22 +1116,51 @@ class Api:
         }
         """
         )
-        entity = entity or self.settings("entity")
-        project = project or self.settings("project")
-        response = self.gql(
-            query,
-            variable_values={
-                "entity": entity,
-                "project": project,
-                "sweep": sweep,
-                "specs": specs,
-            },
-        )
-        if response["project"] is None or response["project"]["sweep"] is None:
-            raise ValueError(f"Sweep {entity}/{project}/{sweep} not found")
-        data: Dict[str, Any] = response["project"]["sweep"]
+        data: Dict[str, Any] = dict()
+        cursorValue = None
+
+        while True:
+            entity = entity or self.settings("entity")
+            project = project or self.settings("project")
+            print("SPECS", specs)
+            response = self.gql(
+                query,
+                variable_values={
+                    "entity": entity,
+                    "project": project,
+                    "sweep": sweep,
+                    "specs": [specs],
+                    "cursorValue": cursorValue,
+                },
+            )
+            if response["project"] is None or response["project"]["sweep"] is None:
+                raise ValueError(f"Sweep {entity}/{project}/{sweep} not found")
+            page_info = response["project"]["sweep"]["runs"]["pageInfo"]
+            if not data:
+                data = response["project"]["sweep"]
+                data['runs'].pop('pageInfo')
+            else:
+                data['runs']['edges'].extend(response['project']['sweep']['runs']['edges'])
+            if not page_info["hasNextPage"]:
+                break
+            # log a message indicating that we are fetching more runs
+            logger.info("Fetching more runs for sweep %s (got %d so far)", sweep, len(data["runs"]))
+            cursorValue = page_info["endCursor"]
         if data:
             data["runs"] = self._flatten_edges(data["runs"])
+        keys = json.loads(specs).get('keys', [])
+        if keys:
+            api = wandb.Api()
+            def _fetch_history(run):
+                return api.run(f"{entity}/{project}/{run['name']}").history(keys=keys)
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                for run in data["runs"]:
+                    run['history'] = executor.submit(_fetch_history, run)
+                for run in data["runs"]:
+                    run['history'] = [
+                        json.dumps(d) for d in 
+                        run['history'].result().to_dict(orient='records')
+                    ]
         return data
 
     @normalize_exceptions
